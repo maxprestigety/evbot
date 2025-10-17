@@ -1,0 +1,7 @@
+discord.py
+httpx
+apscheduler
+python-dotenv
+psycopg[binary]
+redis
+duckdb
