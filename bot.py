@@ -87,32 +87,241 @@ class Play:
 # NOTE: replace this with your real odds provider calls later.
 BOOKS = ["fanduel", "draftkings", "betmgm", "caesars", "pointsbet"]
 
-def sample_plays_for(sport: str, n=12) -> List[Play]:
-    """temporary generator so you can see real embeds immediately."""
-    plays = []
-    for i in range(n):
-        american = random.choice([+110, +120, +135, -105, -110, +145, +100])
-        # symmetric true prob around fair for a bit of spread (+EV & small -EV)
-        fair_p = 1/amer_to_decimal(american)
-        p_true = min(max(fair_p + random.uniform(-0.04, 0.06), 0.05), 0.95)
-        event = f"event {i+1}"
-        market = random.choice(["spread", "total", "player prop"])
-        sel = random.choice(["team a", "team b", "player x o/u"])
-        plays.append(Play(
-            sport=sport, event=event, market=market,
-            selection=f"{sel}", american=american,
-            book=random.choice(BOOKS),
-            p_true=p_true,
-            game_time="7:30 pm est",
-            id_hint=f"{sport}-{i}"
-        ))
-    # keep top 15 by EV
-    plays.sort(key=lambda p: p.ev, reverse=True)
-    return plays[:15]
+import os, httpx, math
 
-def fetch_plays(sport: str) -> List[Play]:
-    """Plug your API here. For now uses sample generator."""
-    return sample_plays_for(sport)
+ODDS_API_KEY = os.getenv("THEODDS_API_KEY")
+TARGET_BOOKS = [b.strip().lower() for b in os.getenv("TARGET_BOOKS", "fanduel,draftkings").split(",")]
+REGION = os.getenv("REGION", "us")
+
+# Which markets to pull (add more later: player_assists, player_rebounds, player_threes, etc.)
+ODDS_MARKETS = "h2h,spreads,totals,player_points"
+
+# optional: treat these as "sharper" when present
+SHARP_BOOKS = {"pinnacle", "circa", "betonline", "william hill", "lowvig"}
+
+def dec_from_american(a: int) -> float:
+    return 1 + (a/100 if a > 0 else 100/abs(a))
+
+def strip_vig_two_way(d1: float, d2: float) -> tuple[float, float]:
+    # raw implied probs
+    p1_raw, p2_raw = 1/d1, 1/d2
+    total = p1_raw + p2_raw
+    if total <= 0:
+        return 0.5, 0.5
+    return p1_raw/total, p2_raw/total
+
+def odds_get(sport_key: str) -> list[dict]:
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    r = httpx.get(url, params={
+        "apiKey": ODDS_API_KEY,
+        "regions": REGION,
+        "markets": ODDS_MARKETS,
+        "oddsFormat": "american"
+    }, timeout=20.0)
+    r.raise_for_status()
+    return r.json()
+
+def pick_fair_two_way(bookmakers: list[dict], market_key: str) -> tuple[float, float] | None:
+    """
+    Build a vig-stripped *consensus* fair prob for a two-way market using any available books.
+    If sharp books are present, weight them higher.
+    Returns (p1_fair, p2_fair) or None if not enough data.
+    """
+    weights = []
+    pairs = []
+    for bm in bookmakers:
+        title = (bm.get("title") or "").lower()
+        for m in bm.get("markets", []):
+            if m.get("key") != market_key:
+                continue
+            outcomes = m.get("outcomes", [])
+            if len(outcomes) != 2:
+                continue
+            d1 = dec_from_american(int(outcomes[0]["price"]))
+            d2 = dec_from_american(int(outcomes[1]["price"]))
+            p1_raw, p2_raw = 1/d1, 1/d2
+            total = p1_raw + p2_raw
+            if total <= 0:
+                continue
+            p1, p2 = p1_raw/total, p2_raw/total
+            w = 2.0 if title in {"pinnacle", "circa", "betonline", "william hill", "lowvig"} else 1.0
+            pairs.append((p1, p2))
+            weights.append(w)
+
+    if not pairs:
+        return None
+    wsum = sum(weights)
+    p1 = sum(p[0]*w for p, w in zip(pairs, weights)) / wsum
+    p2 = 1 - p1
+    return p1, p2
+
+def pick_fair_two_way(bookmakers: list[dict], market_key: str) -> tuple[float, float] | None:
+    """
+    Build a vig-stripped *consensus* fair prob for a two-way market using any available books.
+    If sharp books are present, weight them higher.
+    Returns (p1_fair, p2_fair) or None if not enough data.
+    """
+    weights = []
+    pairs = []
+    for bm in bookmakers:
+        title = (bm.get("title") or "").lower()
+        for m in bm.get("markets", []):
+            if m.get("key") != market_key:  # example: "h2h", "spreads", "totals", "player_points"
+                continue
+            outcomes = m.get("outcomes", [])
+            if len(outcomes) != 2:
+                continue
+            d1 = dec_from_american(int(outcomes[0]["price"]))
+            d2 = dec_from_american(int(outcomes[1]["price"]))
+            p1, p2 = strip_vig_two_way(d1, d2)
+            w = 2.0 if title in SHARP_BOOKS else 1.0
+            pairs.append((p1, p2))
+            weights.append(w)
+
+    if not pairs:
+        return None
+    # weighted average
+    wsum = sum(weights)
+    p1 = sum(p[0]*w for p, w in zip(pairs, weights)) / wsum
+    p2 = 1 - p1
+    return p1, p2
+
+def plays_from_two_way_market(
+    sport: str,
+    event_name: str,
+    market_key: str,
+    label1: str, label2: str,
+    fair_p1: float, fair_p2: float,
+    target_offers: list[tuple[str, dict]]
+) -> list["Play"]:
+    """Build Play objects for each side from the target book offers (if present)."""
+    out: list["Play"] = []
+    for book_name, market in target_offers:
+        outcomes = market.get("outcomes", [])
+        if len(outcomes) != 2:
+            continue
+        names_lower = [o.get("name","").lower() for o in outcomes]
+        if label1.lower() in names_lower and label2.lower() in names_lower:
+            i1, i2 = names_lower.index(label1.lower()), names_lower.index(label2.lower())
+        else:
+            i1, i2 = 0, 1
+        o1, o2 = outcomes[i1], outcomes[i2]
+        a1, a2 = int(o1["price"]), int(o2["price"])
+
+        fair_probs = [fair_p1, fair_p2]
+        dec_odds = [1 + (a/100 if a > 0 else 100/abs(a)) for a in [a1, a2]]
+        evs = [fair_probs[i] * dec_odds[i] - 1 for i in range(2)]
+
+        out.append(Play(
+            sport=sport, event=event_name, market=market_key,
+            selection=o1.get("name","side1"), american=a1, book=book_name, p_true=fair_p1
+        ))
+        out.append(Play(
+            sport=sport, event=event_name, market=market_key,
+            selection=o2.get("name","side2"), american=a2, book=book_name, p_true=fair_p2
+        ))
+
+    out.sort(key=lambda p: p.ev, reverse=True)
+    return [p for p in out if p.ev >= 0.02]
+
+SPORT_MAP = {
+    "nba": "basketball_nba",
+    "nfl": "americanfootball_nfl",
+    "mlb": "baseball_mlb",
+    "nhl": "icehockey_nhl",
+    "soccer": "soccer_epl",
+}
+
+def fetch_plays(sport: str) -> list["Play"]:
+    """Fetch live odds and build EV-ranked plays for one sport."""
+    sport_key = SPORT_MAP.get(sport, None)
+    if not sport_key:
+        return []
+    games = odds_get(sport_key)
+    plays: list["Play"] = []
+
+    for g in games:
+        event_name = f"{g.get('home_team','')} vs {g.get('away_team','')}"
+        bookmakers = g.get("bookmakers", [])
+        target_markets: dict[str, list[tuple[str, dict]]] = {}
+
+        for bm in bookmakers:
+            bm_title = (bm.get("title") or "").lower()
+            if bm_title not in {"fanduel", "draftkings", "betmgm", "caesars"}:
+                continue
+            for m in bm.get("markets", []):
+                key = m.get("key")
+                target_markets.setdefault(key, []).append((bm_title, m))
+
+        if "h2h" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "h2h")
+            if fair:
+                p1, p2 = fair
+                plays += plays_from_two_way_market(sport, event_name, "h2h", "home", "away", p1, p2, target_markets["h2h"])
+
+        if "totals" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "totals")
+            if fair:
+                p1, p2 = fair
+                plays += plays_from_two_way_market(sport, event_name, "totals", "over", "under", p1, p2, target_markets["totals"])
+
+        if "spreads" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "spreads")
+            if fair:
+                p1, p2 = fair
+                plays += plays_from_two_way_market(sport, event_name, "spreads", "side1", "side2", p1, p2, target_markets["spreads"])
+
+    uniq = {}
+    for p in plays:
+        key = (p.sport, p.event, p.market, p.selection, p.book, p.american)
+        if key not in uniq or p.ev > uniq[key].ev:
+            uniq[key] = p
+
+    ranked = sorted(uniq.values(), key=lambda x: x.ev, reverse=True)
+    return ranked[:50]
+
+def plays_from_two_way_market(
+    sport: str,
+    event_name: str,
+    market_key: str,
+    label1: str, label2: str,
+    fair_p1: float, fair_p2: float,
+    target_offers: list[tuple[str, dict]]
+) -> list[Play]:
+    """Build Play objects for each side from the target book offers (if present)."""
+    out: list[Play] = []
+    for book_name, market in target_offers:
+        outcomes = market.get("outcomes", [])
+        if len(outcomes) != 2:
+            continue
+        # map fair probs to the correct outcome order by name
+        names_lower = [o.get("name","").lower() for o in outcomes]
+        # try to align: assume first outcome corresponds to label1 in most cases
+        # If labels exist in names, match them
+        if label1.lower() in names_lower and label2.lower() in names_lower:
+            i1, i2 = names_lower.index(label1.lower()), names_lower.index(label2.lower())
+        else:
+            i1, i2 = 0, 1
+        o1, o2 = outcomes[i1], outcomes[i2]
+
+        a1, a2 = int(o1["price"]), int(o2["price"])
+        d1, d2 = dec_from_american(a1), dec_from_american(a2)
+
+        ev1 = fair_p1 * d1 - 1.0
+        ev2 = fair_p2 * d2 - 1.0
+
+        out.append(Play(
+            sport=sport, event=event_name, market=market_key,
+            selection=f"{o1.get('name','side1')}", american=a1, book=book_name, p_true=fair_p1
+        ))
+        out.append(Play(
+            sport=sport, event=event_name, market=market_key,
+            selection=f"{o2.get('name','side2')}", american=a2, book=book_name, p_true=fair_p2
+        ))
+    # keep high EV only
+    out.sort(key=lambda p: p.ev, reverse=True)
+    return [p for p in out if p.ev >= 0.02]  # require >= +2% EV
+
 
 # ========= parlay generation =========
 def correlated(a: Play, b: Play) -> bool:
@@ -343,5 +552,56 @@ async def on_ready():
         ch = client.get_channel(int(HEARTBEAT_CH))
         if ch:
             await ch.send("👋 bot is online and ready!")
+
+@tree.command(
+    name="ev_scan",
+    description="scan live odds for a sport (nba/nfl/mlb/nhl/soccer) and post the top N EV singles"
+)
+@app_commands.describe(
+    sport="nba, nfl, mlb, nhl, or soccer",
+    top_n="how many to post (default 5)"
+)
+async def ev_scan(interaction: discord.Interaction, sport: str, top_n: int = 5):
+    # only the command runner will see status messages
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # normalize sport input
+    sport = sport.lower().strip()
+    if sport not in {"nba", "nfl", "mlb", "nhl", "soccer"}:
+        await interaction.followup.send(
+            "invalid sport. use one of: nba, nfl, mlb, nhl, soccer.",
+            ephemeral=True
+        )
+        return
+
+    # fetch plays using the Odds API pipeline you added
+    try:
+        plays = fetch_plays(sport)
+    except Exception as e:
+        await interaction.followup.send(f"error fetching odds: {e}", ephemeral=True)
+        return
+
+    if not plays:
+        await interaction.followup.send(f"no plays found for {sport}.", ephemeral=True)
+        return
+
+    # find the correct channel (e.g., nba → #nba-alerts)
+    channel = await route(interaction.guild, sport)
+    if not channel:
+        await interaction.followup.send(
+            f"couldn’t find a channel for {sport} (expected something like #{sport}-alerts).",
+            ephemeral=True
+        )
+        return
+
+    # cap posts and send embeds
+    top_n = max(1, min(top_n, 10))
+    for p in plays[:top_n]:
+        await channel.send(embed=ev_embed(p))
+
+    await interaction.followup.send(
+        f"posted top {top_n} {sport.upper()} singles to #{channel.name}.",
+        ephemeral=True
+    )
 
 client.run(TOKEN)
