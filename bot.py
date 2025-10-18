@@ -17,6 +17,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 HEARTBEAT_CH = os.getenv("HEARTBEAT_CHANNEL_ID")
 AUTO_POST = os.getenv("AUTO_POST", "0") == "1"       # turn on in Railway to automate
 POST_INTERVAL_MIN = int(os.getenv("POST_INTERVAL_MIN", "15"))
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+GUILD_OBJ = discord.Object(id=int(DISCORD_GUILD_ID)) if DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit() else None
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -94,7 +96,7 @@ TARGET_BOOKS = [b.strip().lower() for b in os.getenv("TARGET_BOOKS", "fanduel,dr
 REGION = os.getenv("REGION", "us")
 
 # Which markets to pull (add more later: player_assists, player_rebounds, player_threes, etc.)
-ODDS_MARKETS = "h2h,spreads,totals,player_points"
+ODDS_MARKETS = "h2h,spreads,totals"
 
 # optional: treat these as "sharper" when present
 SHARP_BOOKS = {"pinnacle", "circa", "betonline", "william hill", "lowvig"}
@@ -111,15 +113,203 @@ def strip_vig_two_way(d1: float, d2: float) -> tuple[float, float]:
     return p1_raw/total, p2_raw/total
 
 def odds_get(sport_key: str) -> list[dict]:
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    r = httpx.get(url, params={
-        "apiKey": ODDS_API_KEY,
-        "regions": REGION,
-        "markets": ODDS_MARKETS,
-        "oddsFormat": "american"
-    }, timeout=20.0)
-    r.raise_for_status()
-    return r.json()
+    ODDS_MARKETS = "h2h,spreads,totals"  # remove player_points for now
+    try:
+        r = httpx.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+            params={
+                "apiKey": ODDS_API_KEY,
+                "regions": REGION,
+                "markets": ODDS_MARKETS,
+                "oddsFormat": "american",
+            },
+            timeout=20.0,
+        )
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        print(f"[odds_get] HTTP {e.response.status_code}: {e.response.text}")
+        return []
+    except Exception as e:
+        print(f"[odds_get] error: {e}")
+        return []
+
+SHARP_BOOKS = {"pinnacle", "circa", "betonline", "william hill", "lowvig"}
+
+def dec_from_american(a: int) -> float:
+    return 1 + (a / 100 if a > 0 else 100 / abs(a))
+
+def pick_fair_two_way(bookmakers: list[dict], market_key: str) -> tuple[float, float] | None:
+    """
+    Build a vig-stripped *consensus* fair prob for a two-way market using any available books.
+    If sharp books are present, weight them higher.
+    Returns (p1_fair, p2_fair) or None if not enough data.
+    """
+    weights: list[float] = []
+    pairs: list[tuple[float, float]] = []
+
+    for bm in bookmakers:
+        title = (bm.get("title") or "").lower()
+        for m in bm.get("markets", []):
+            if m.get("key") != market_key:  # "h2h" | "spreads" | "totals" | "player_points"
+                continue
+            outcomes = m.get("outcomes", [])
+            if len(outcomes) != 2:
+                continue
+            d1 = dec_from_american(int(outcomes[0]["price"]))
+            d2 = dec_from_american(int(outcomes[1]["price"]))
+
+            # vig-stripped probs for a 2-way market
+            p1_raw, p2_raw = 1 / d1, 1 / d2
+            overround = p1_raw + p2_raw
+            if overround <= 0:
+                continue
+            p1, p2 = p1_raw / overround, p2_raw / overround
+
+            w = 2.0 if title in SHARP_BOOKS else 1.0
+            pairs.append((p1, p2))
+            weights.append(w)
+
+    if not pairs:
+        return None
+
+    total_w = sum(weights)
+    p1 = sum(p[0] * w for p, w in zip(pairs, weights)) / total_w
+    p2 = 1 - p1
+    return p1, p2
+
+def plays_from_two_way_market(
+    sport: str,
+    event_name: str,
+    market_key: str,
+    label1: str, label2: str,
+    fair_p1: float, fair_p2: float,
+    target_offers: list[tuple[str, dict]]
+) -> list["Play"]:
+    """
+    Build Play objects for each side from the target-book offers provided.
+    label1/label2 are hints for aligning 'over/under' when possible.
+    """
+    out: list["Play"] = []
+    for book_name, market in target_offers:
+        outcomes = market.get("outcomes", [])
+        if len(outcomes) != 2:
+            continue
+
+        names_lower = [o.get("name", "").lower() for o in outcomes]
+        # Try to align to Over/Under or known labels when present
+        if label1.lower() in names_lower and label2.lower() in names_lower:
+            i1, i2 = names_lower.index(label1.lower()), names_lower.index(label2.lower())
+        else:
+            i1, i2 = 0, 1  # fallback
+
+        o1, o2 = outcomes[i1], outcomes[i2]
+        a1, a2 = int(o1["price"]), int(o2["price"])
+
+        # EV = p_fair * decimal - 1
+        d1 = dec_from_american(a1)
+        d2 = dec_from_american(a2)
+
+        # Construct plays; keep all, we'll filter by EV afterwards
+        out.append(Play(
+            sport=sport, event=event_name, market=market_key,
+            selection=o1.get("name", "side1"), american=a1, book=book_name, p_true=fair_p1
+        ))
+        out.append(Play(
+            sport=sport, event=event_name, market=market_key,
+            selection=o2.get("name", "side2"), american=a2, book=book_name, p_true=fair_p2
+        ))
+
+    # rank by EV and keep positive edges
+    out.sort(key=lambda p: p.ev, reverse=True)
+    return [p for p in out if p.ev >= 0.02]  # require >= +2% EV
+
+SPORT_MAP = {
+    "nba": "basketball_nba",
+    "nfl": "americanfootball_nfl",
+    "mlb": "baseball_mlb",
+    "nhl": "icehockey_nhl",
+    "soccer": "soccer_epl",  # adjust to your preferred league(s)
+}
+
+def fetch_plays(sport: str) -> list["Play"]:
+    """
+    Fetch live odds from The Odds API and return EV-ranked plays for one sport.
+    Depends on:
+      - ODDS_API_KEY (env)
+      - REGION (env, default "us")
+      - TARGET_BOOKS (env list: "fanduel,draftkings,betmgm,caesars")
+    """
+    sport_key = SPORT_MAP.get(sport)
+    if not sport_key:
+        return []
+
+    games = odds_get(sport_key)  # <- keep your existing odds_get
+    if not games:
+    return []  # nothing fetched; keep bot stable
+
+    plays: list["Play"] = []
+
+    for g in games:
+        event_name = f"{g.get('home_team', '')} vs {g.get('away_team', '')}".strip()
+        bookmakers = g.get("bookmakers", [])
+
+        # collect target-book offers by market key
+        target_markets: dict[str, list[tuple[str, dict]]] = {}
+        for bm in bookmakers:
+            bm_title = (bm.get("title") or "").lower()
+            if bm_title not in TARGET_BOOKS:
+                continue
+            for m in bm.get("markets", []):
+                key = m.get("key")  # "h2h" | "spreads" | "totals" | "player_points" ...
+                target_markets.setdefault(key, []).append((bm_title, m))
+
+        # moneyline (h2h)
+        if "h2h" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "h2h")
+            if fair:
+                p1, p2 = fair
+                plays += plays_from_two_way_market(
+                    sport, event_name, "h2h", "home", "away", p1, p2, target_markets["h2h"]
+                )
+
+        # totals (Over/Under)
+        if "totals" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "totals")
+            if fair:
+                p_over, p_under = fair
+                plays += plays_from_two_way_market(
+                    sport, event_name, "totals", "over", "under", p_over, p_under, target_markets["totals"]
+                )
+
+        # spreads (two-way against a number)
+        if "spreads" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "spreads")
+            if fair:
+                p1, p2 = fair
+                plays += plays_from_two_way_market(
+                    sport, event_name, "spreads", "side1", "side2", p1, p2, target_markets["spreads"]
+                )
+
+        # player points (Over/Under)
+        if "player_points" in target_markets:
+            fair = pick_fair_two_way(bookmakers, "player_points")
+            if fair:
+                p_over, p_under = fair
+                plays += plays_from_two_way_market(
+                    sport, event_name, "player_points", "over", "under", p_over, p_under, target_markets["player_points"]
+                )
+
+    # light dedupe + final rank
+    uniq: dict[tuple, Play] = {}
+    for p in plays:
+        k = (p.sport, p.event, p.market, p.selection, p.book, p.american)
+        if k not in uniq or p.ev > uniq[k].ev:
+            uniq[k] = p
+
+    ranked = sorted(uniq.values(), key=lambda x: x.ev, reverse=True)
+    return ranked[:50]
+
 
 def pick_fair_two_way(bookmakers: list[dict], market_key: str) -> tuple[float, float] | None:
     """
@@ -440,9 +630,11 @@ async def autopost():
     sports = ["nba", "nfl", "mlb"]  # add more when ready
     all_candidates: List[Play] = []
     for s in sports:
+    try:
         plays = fetch_plays(s)
-        if not plays:
-            continue
+    except Exception as e:
+        print(f"[autopost] fetch_plays error for {s}: {e}")
+        continue
         all_candidates.extend(plays)
 
         # post the top single EV alert per sport
@@ -553,6 +745,8 @@ async def on_ready():
         if ch:
             await ch.send("👋 bot is online and ready!")
 
+if GUILD_OBJ:
+    @app_commands.guilds(GUILD_OBJ)
 @tree.command(
     name="ev_scan",
     description="scan live odds for a sport (nba/nfl/mlb/nhl/soccer) and post the top N EV singles"
@@ -603,5 +797,48 @@ async def ev_scan(interaction: discord.Interaction, sport: str, top_n: int = 5):
         f"posted top {top_n} {sport.upper()} singles to #{channel.name}.",
         ephemeral=True
     )
+import os
+GUILD_ID_ENV = os.getenv("DISCORD_GUILD_ID")
+GUILD_OBJ = discord.Object(id=int(GUILD_ID_ENV)) if GUILD_ID_ENV and GUILD_ID_ENV.isdigit() else None
+
+@client.event
+async def on_ready():
+    print(f"✅ logged in as {client.user} (id: {client.user.id})")
+    # force guild sync so commands show instantly
+    try:
+        if GUILD_OBJ:
+            synced = await tree.sync(guild=GUILD_OBJ)
+            print(f"🔄 synced {len(synced)} commands to guild {GUILD_OBJ.id}")
+        else:
+            for g in client.guilds:
+                s = await tree.sync(guild=g)
+                print(f"🔄 synced {len(s)} commands to guild {g.id}")
+        await tree.sync()
+        print("🌐 global sync requested")
+    except Exception as e:
+        print(f"❌ slash sync error: {e}")
+
+@client.event
+async def setup_hook():
+    try:
+        if GUILD_OBJ:
+            synced = await tree.sync(guild=GUILD_OBJ)
+            print(f"🔄 synced {len(synced)} commands to guild {GUILD_OBJ.id}")
+        else:
+            # fallback: sync to every guild the bot is in
+            for g in client.guilds:
+                s = await tree.sync(guild=g)
+                print(f"🔄 synced {len(s)} commands to guild {g.id}")
+        await tree.sync()  # optional global publish
+        print("🌐 global sync requested")
+    except Exception as e:
+        print(f"❌ slash sync error: {e}")
+
+    # start your tasks after sync (keep your existing logic)
+    if HEARTBEAT_CH and not heartbeat.is_running():
+        heartbeat.start()
+    if AUTO_POST and not autopost.is_running():
+        autopost.start()
+
 
 client.run(TOKEN)
