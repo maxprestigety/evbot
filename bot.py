@@ -250,9 +250,11 @@ def fetch_plays(sport: str) -> list["Play"]:
 
     games = odds_get(sport_key)  # <- keep your existing odds_get
     if not games:
-    return []  # nothing fetched; keep bot stable
+        return []  # nothing fetched; keep bot stable
 
     plays: list["Play"] = []
+    # ... (rest of your function stays the same)
+
 
     for g in games:
         event_name = f"{g.get('home_team', '')} vs {g.get('away_team', '')}".strip()
@@ -419,12 +421,21 @@ SPORT_MAP = {
 }
 
 def fetch_plays(sport: str) -> list["Play"]:
-    """Fetch live odds and build EV-ranked plays for one sport."""
-    sport_key = SPORT_MAP.get(sport, None)
+    """
+    Fetch live odds from The Odds API and return EV-ranked plays for one sport.
+    Depends on: ODDS_API_KEY, REGION, TARGET_BOOKS
+    """
+    sport_key = SPORT_MAP.get(sport)
     if not sport_key:
         return []
-    games = odds_get(sport_key)
+
+    games = odds_get(sport_key)  # <- keep your existing odds_get
+    if not games:
+        return []  # nothing fetched; keep bot stable
+
     plays: list["Play"] = []
+    # ... keep the rest of your function below unchanged ...
+
 
     for g in games:
         event_name = f"{g.get('home_team','')} vs {g.get('away_team','')}"
