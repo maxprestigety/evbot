@@ -257,27 +257,46 @@ def fetch_plays(sport: str) -> list["Play"]:
 
 
     for g in games:
-        event_name = f"{g.get('home_team', '')} vs {g.get('away_team', '')}".strip()
-        bookmakers = g.get("bookmakers", [])
+    event_name = f"{g.get('home_team', '')} vs {g.get('away_team', '')}".strip()
+    bookmakers = g.get("bookmakers", [])
 
-        # collect target-book offers by market key
-        target_markets: dict[str, list[tuple[str, dict]]] = {}
-        for bm in bookmakers:
-            bm_title = (bm.get("title") or "").lower()
-            if bm_title not in TARGET_BOOKS:
-                continue
-            for m in bm.get("markets", []):
-                key = m.get("key")  # "h2h" | "spreads" | "totals" 
-                target_markets.setdefault(key, []).append((bm_title, m))
+    # collect target-book offers by market key
+    target_markets: dict[str, list[tuple[str, dict]]] = {}
+    for bm in bookmakers:
+        bm_title = (bm.get("title") or "").lower()
+        if bm_title not in TARGET_BOOKS:
+            continue
+        for m in bm.get("markets", []):
+            key = m.get("key")  # "h2h" | "spreads" | "totals"
+            target_markets.setdefault(key, []).append((bm_title, m))
 
-        # moneyline (h2h)
-        if "h2h" in target_markets:
-            fair = pick_fair_two_way(bookmakers, "h2h")
-            if fair:
-                p1, p2 = fair
-                plays += plays_from_two_way_market(
-                    sport, event_name, "h2h", "home", "away", p1, p2, target_markets["h2h"]
-                )
+    # moneyline (h2h)
+    if "h2h" in target_markets:
+        fair = pick_fair_two_way(bookmakers, "h2h")
+        if fair:
+            p1, p2 = fair
+            plays += plays_from_two_way_market(
+                sport, event_name, "h2h", "home", "away", p1, p2, target_markets["h2h"]
+            )
+
+    # totals (Over/Under)
+    if "totals" in target_markets:
+        fair = pick_fair_two_way(bookmakers, "totals")
+        if fair:
+            p_over, p_under = fair
+            plays += plays_from_two_way_market(
+                sport, event_name, "totals", "over", "under", p_over, p_under, target_markets["totals"]
+            )
+
+    # spreads
+    if "spreads" in target_markets:
+        fair = pick_fair_two_way(bookmakers, "spreads")
+        if fair:
+            p1, p2 = fair
+            plays += plays_from_two_way_market(
+                sport, event_name, "spreads", "side1", "side2", p1, p2, target_markets["spreads"]
+            )
+
 
         # totals (Over/Under)
         if "totals" in target_markets:
@@ -636,8 +655,8 @@ async def autopost():
     # --- fetch/update plays by sport ---
     sports = ["nba", "nfl", "mlb"]  # add more when ready
     all_candidates: List[Play] = []
-    for s in sports:
-    try:
+    for g in games:
+        try:
         plays = fetch_plays(s)
     except Exception as e:
         print(f"[autopost] fetch_plays error for {s}: {e}")
