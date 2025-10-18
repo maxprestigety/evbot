@@ -708,6 +708,20 @@ async def force_parlays(interaction: discord.Interaction):
     await interaction.followup.send(f"posted {len(parlays)} sample parlays to #top-5-parlays", ephemeral=True)
 
 # ======= /setup_server (unchanged, keeps your professional layout) =======
+@tree.command(name="ping", description="bot health check")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong ✅", ephemeral=True)
+
+@tree.command(name="diagnostics", description="report basic env + sync info")
+async def diagnostics(interaction: discord.Interaction):
+    info = [
+        f"user: {client.user} ({client.user.id})",
+        f"guilds: {[g.id for g in client.guilds]}",
+        f"region: {REGION}",
+        f"auto_post: {os.getenv('AUTO_POST','0')}",
+    ]
+    await interaction.response.send_message("```\n" + "\n".join(info) + "\n```", ephemeral=True)
+
 @tree.command(name="setup_server", description="create the full house edge server layout")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_server(interaction: discord.Interaction):
@@ -779,50 +793,68 @@ if GUILD_OBJ:
 )
 @app_commands.describe(
     sport="nba, nfl, mlb, nhl, or soccer",
-    top_n="how many to post (default 5)"
+    top_n="how many to post (default 5; max 10)"
 )
 async def ev_scan(interaction: discord.Interaction, sport: str, top_n: int = 5):
-    # only the command runner will see status messages
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    # normalize sport input
-    sport = sport.lower().strip()
-    if sport not in {"nba", "nfl", "mlb", "nhl", "soccer"}:
-        await interaction.followup.send(
-            "invalid sport. use one of: nba, nfl, mlb, nhl, soccer.",
-            ephemeral=True
-        )
-        return
-
-    # fetch plays using the Odds API pipeline you added
+    # 1) immediately defer so Discord doesn't time out
     try:
-        plays = fetch_plays(sport)
-    except Exception as e:
-        await interaction.followup.send(f"error fetching odds: {e}", ephemeral=True)
-        return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        # already deferred/ack’d, ignore
+        pass
 
-    if not plays:
-        await interaction.followup.send(f"no plays found for {sport}.", ephemeral=True)
-        return
+    try:
+        print(f"[ev_scan] start sport={sport} top_n={top_n}")
+        sport = (sport or "").lower().strip()
+        if sport not in {"nba", "nfl", "mlb", "nhl", "soccer"}:
+            await interaction.followup.send(
+                "invalid sport. use: nba, nfl, mlb, nhl, soccer.", ephemeral=True
+            )
+            return
 
-    # find the correct channel (e.g., nba → #nba-alerts)
-    channel = await route(interaction.guild, sport)
-    if not channel:
+        # 2) call fetch_plays in a safe thread with a hard timeout
+        #    (prevents long network hangs from killing the command)
+        async def _fetch():
+            return fetch_plays(sport)
+
+        plays = await asyncio.wait_for(_fetch(), timeout=20)  # 20s hard cap
+        if not plays:
+            await interaction.followup.send(f"no plays found for {sport}.", ephemeral=True)
+            print(f"[ev_scan] no plays for {sport}")
+            return
+
+        # 3) route to the sport channel and send posts
+        ch = await route(interaction.guild, sport)
+        if not ch:
+            await interaction.followup.send(
+                f"couldn’t find a channel for {sport} (expected like #{sport}-alerts).",
+                ephemeral=True
+            )
+            print(f"[ev_scan] missing channel for {sport}")
+            return
+
+        top_n = max(1, min(10, int(top_n)))
+        sent = 0
+        for p in plays[:top_n]:
+            try:
+                await ch.send(embed=ev_embed(p))
+                sent += 1
+            except Exception as e:
+                print(f"[ev_scan] send embed failed: {e}")
+
         await interaction.followup.send(
-            f"couldn’t find a channel for {sport} (expected something like #{sport}-alerts).",
+            f"posted top {sent} {sport.upper()} singles to #{ch.name}.",
             ephemeral=True
         )
-        return
+        print(f"[ev_scan] done sport={sport} sent={sent}")
+    except asyncio.TimeoutError:
+        await interaction.followup.send("fetch timed out (20s). try again in a moment.", ephemeral=True)
+        print("[ev_scan] timeout while fetching")
+    except Exception as e:
+        # 4) last-ditch: show a human message + log the exact error
+        await interaction.followup.send(f"error while scanning: {e}", ephemeral=True)
+        print(f"[ev_scan] crash: {repr(e)}")
 
-    # cap posts and send embeds
-    top_n = max(1, min(top_n, 10))
-    for p in plays[:top_n]:
-        await channel.send(embed=ev_embed(p))
-
-    await interaction.followup.send(
-        f"posted top {top_n} {sport.upper()} singles to #{channel.name}.",
-        ephemeral=True
-    )
 import os
 GUILD_ID_ENV = os.getenv("DISCORD_GUILD_ID")
 GUILD_OBJ = discord.Object(id=int(GUILD_ID_ENV)) if GUILD_ID_ENV and GUILD_ID_ENV.isdigit() else None
