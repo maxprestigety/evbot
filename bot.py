@@ -113,16 +113,20 @@ def strip_vig_two_way(d1: float, d2: float) -> tuple[float, float]:
     return p1_raw/total, p2_raw/total
 
 def odds_get(sport_key: str) -> list[dict]:
-    ODDS_MARKETS = "h2h,spreads,totals"  # remove player_points for now
+    # single source of truth for markets (NO player props here)
+    ODDS_MARKETS = "h2h,spreads,totals"
+
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": REGION,
+        "markets": ODDS_MARKETS,
+        "oddsFormat": "american",
+    }
     try:
+        print(f"[odds_get] sport_key={sport_key} params={params}")  # <- verify in Railway logs
         r = httpx.get(
             f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-            params={
-                "apiKey": ODDS_API_KEY,
-                "regions": REGION,
-                "markets": ODDS_MARKETS,
-                "oddsFormat": "american",
-            },
+            params=params,
             timeout=20.0,
         )
         r.raise_for_status()
@@ -151,7 +155,7 @@ def pick_fair_two_way(bookmakers: list[dict], market_key: str) -> tuple[float, f
     for bm in bookmakers:
         title = (bm.get("title") or "").lower()
         for m in bm.get("markets", []):
-            if m.get("key") != market_key:  # "h2h" | "spreads" | "totals" | "player_points"
+            if m.get("key") != market_key:  # "h2h" | "spreads" | "totals" 
                 continue
             outcomes = m.get("outcomes", [])
             if len(outcomes) != 2:
@@ -261,7 +265,7 @@ def fetch_plays(sport: str) -> list["Play"]:
             if bm_title not in TARGET_BOOKS:
                 continue
             for m in bm.get("markets", []):
-                key = m.get("key")  # "h2h" | "spreads" | "totals" | "player_points" ...
+                key = m.get("key")  # "h2h" | "spreads" | "totals" 
                 target_markets.setdefault(key, []).append((bm_title, m))
 
         # moneyline (h2h)
@@ -291,14 +295,6 @@ def fetch_plays(sport: str) -> list["Play"]:
                     sport, event_name, "spreads", "side1", "side2", p1, p2, target_markets["spreads"]
                 )
 
-        # player points (Over/Under)
-        if "player_points" in target_markets:
-            fair = pick_fair_two_way(bookmakers, "player_points")
-            if fair:
-                p_over, p_under = fair
-                plays += plays_from_two_way_market(
-                    sport, event_name, "player_points", "over", "under", p_over, p_under, target_markets["player_points"]
-                )
 
     # light dedupe + final rank
     uniq: dict[tuple, Play] = {}
@@ -356,7 +352,7 @@ def pick_fair_two_way(bookmakers: list[dict], market_key: str) -> tuple[float, f
     for bm in bookmakers:
         title = (bm.get("title") or "").lower()
         for m in bm.get("markets", []):
-            if m.get("key") != market_key:  # example: "h2h", "spreads", "totals", "player_points"
+            if m.get("key") != market_key:  # example: "h2h", "spreads", "totals"
                 continue
             outcomes = m.get("outcomes", [])
             if len(outcomes) != 2:
